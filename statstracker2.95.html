@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="manifest" href="manifest.json">
+    <title>Play the Percentage Golf - Advanced Stats Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script type="module">
+        // --- IMPORTS ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, doc, getDoc, deleteDoc, writeBatch, serverTimestamp, getDocs, setDoc, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-analytics.js";
+
+        // --- GLOBAL VARIABLES & STATE ---
+        let app, auth, db, analytics;
+        let currentUserId = null;
+        let chartInstances = {};
+        let expectedStrokesData = {};
+        let firestorePathIdentifier = '';
+
+        const appState = {
+            roundData: null, currentHoleData: null, currentShotNumber: 1,
+            currentShotStartLie: 'tee', currentShotStartDistance: 0,
+            currentHoleTotalStrokes: 0, currentHolePenalties: 0, currentHoleNumber: 1,
+            knownCourses: {}, earnedAchievements: new Set(),
+            currentPuttElevation: 'flat', currentPuttBreak: 'straight'
+        };
+
+        const LOCAL_STORAGE_KEY = 'playPercentageGolfSession';
+
+        // --- UI Elements ---
+        let pageDashboard, pageDataEntry, navLinkDashboard, navLinkDataEntry,
+            initialRoundSetupForm, courseNameInput, courseDatalist, roundDateInput,
+            holeSetupSection, holeInfoForm,
+            shotEntrySection, shotDataForm, puttDetailsSection,
+            currentHoleNumberDisplay, currentHoleNumberDisplayClone, currentShotNumberDisplay, currentShotStartLieDisplay, currentShotStartDistanceDisplay,
+            finishHoleButton, finishRoundButton, undoShotButton, holedOutButton,
+            recalculateRoundsButton, roundsTableBody, userIdDisplay,
+            loadingIndicator, messageModal, messageText, closeMessageModalButton,
+            resumeSessionModal, resumeSessionButton, discardSessionButton,
+            statsSummary, puttingStatsSummary, achievementsContainer,
+            gamificationModal, gamificationModalIcon, gamificationModalTitle, gamificationModalText, closeGamificationModalButton, celebrationBanner;
+
+        function assignUIElements() {
+            pageDashboard = document.getElementById('pageDashboard');
+            pageDataEntry = document.getElementById('pageDataEntry');
+            navLinkDashboard = document.getElementById('navLinkDashboard');
+            navLinkDataEntry = document.getElementById('navLinkDataEntry');
+            initialRoundSetupForm = document.getElementById('initialRoundSetupForm');
+            courseNameInput = document.getElementById('roundCourseName');
+            courseDatalist = document.getElementById('course-list');
+            roundDateInput = document.getElementById('roundDate');
+            holeSetupSection = document.getElementById('holeSetupSection');
+            shotEntrySection = document.getElementById('shotEntrySection');
+            puttDetailsSection = document.getElementById('puttDetailsSection');
+            holeInfoForm = document.getElementById('holeInfoForm');
+            shotDataForm = document.getElementById('shotDataForm');
+            currentHoleNumberDisplay = document.getElementById('currentHoleNumberDisplay');
+            currentHoleNumberDisplayClone = document.getElementById('currentHoleNumberDisplayClone');
+            currentShotNumberDisplay = document.getElementById('currentShotNumberDisplay');
+            currentShotStartLieDisplay = document.getElementById('currentShotStartLieDisplay');
+            currentShotStartDistanceDisplay = document.getElementById('currentShotStartDistanceDisplay');
+            finishHoleButton = document.getElementById('finishHoleButton');
+            finishRoundButton = document.getElementById('finishRoundButton');
+            undoShotButton = document.getElementById('undoShotButton');
+            holedOutButton = document.getElementById('holedOutButton');
+            recalculateRoundsButton = document.getElementById('recalculateRoundsButton');
+            roundsTableBody = document.getElementById('roundsTableBody');
+            userIdDisplay = document.getElementById('userIdDisplay');
+            loadingIndicator = document.getElementById('loadingIndicator');
+            messageModal = document.getElementById('messageModal');
+            messageText = document.getElementById('messageText');
+            closeMessageModalButton = document.getElementById('closeMessageModalButton');
+            resumeSessionModal = document.getElementById('resumeSessionModal');
+            resumeSessionButton = document.getElementById('resumeSessionButton');
+            discardSessionButton = document.getElementById('discardSessionButton');
+            statsSummary = document.getElementById('statsSummary');
+            puttingStatsSummary = document.getElementById('puttingStatsSummary');
+            achievementsContainer = document.getElementById('achievementsContainer');
+            gamificationModal = document.getElementById('gamificationModal');
+            gamificationModalIcon = document.getElementById('gamificationModalIcon');
+            gamificationModalTitle = document.getElementById('gamificationModalTitle');
+            gamificationModalText = document.getElementById('gamificationModalText');
+            closeGamificationModalButton = document.getElementById('closeGamificationModalButton');
+            celebrationBanner = document.getElementById('celebrationBanner');
+            if (roundDateInput) roundDateInput.value = new Date().toISOString().split('T')[0];
+        }
+        
+        // --- GAMIFICATION & PROFILE STUBS ---
+        const ACHIEVEMENTS_LIST = {
+            first_round: { title: "Getting Started", text: "Completed your first round!", icon: '⛳️' },
+            first_birdie: { title: "Birdie Machine", text: "You made your first birdie!", icon: '🐦' },
+            positive_sg_round: { title: "Better than Average", text: "Finished a round with positive total Strokes Gained!", icon: '📈' },
+            bogey_free: { title: "Mr. Consistent", text: "Completed a round with zero bogeys or worse!", icon: '🛡️' }
+        };
+        function showGamificationModal(achievementId) { const ach = ACHIEVEMENTS_LIST[achievementId]; if (!ach || !gamificationModal) return; gamificationModalIcon.textContent = ach.icon; gamificationModalTitle.textContent = ach.title; gamificationModalText.textContent = ach.text; gamificationModal.classList.remove('hidden'); }
+        async function checkAndAwardAchievements(currentRound, allRoundsData) { const newAchievements = []; const checkAndAdd = (id) => { if (!appState.earnedAchievements.has(id)) { newAchievements.push(id); appState.earnedAchievements.add(id); } }; if(allRoundsData.length === 0) checkAndAdd('first_round'); if (currentRound.holes.some(h => h.score <= h.par - 1)) checkAndAdd('first_birdie'); if (currentRound.totalSG > 0) checkAndAdd('positive_sg_round'); if (currentRound.holes.every(h => h.score <= h.par)) checkAndAdd('bogey_free'); if (newAchievements.length > 0) { await setDoc(doc(db, `users/${currentUserId}/profile`, 'achievements'), { unlocked: Array.from(appState.earnedAchievements) }, { merge: true }); showGamificationModal(newAchievements[0]); } }
+        async function fetchEarnedAchievements() { if (!currentUserId || !db) return; try { const achDoc = await getDoc(doc(db, `users/${currentUserId}/profile`, 'achievements')); if (achDoc.exists()) appState.earnedAchievements = new Set(achDoc.data().unlocked || []); } catch (error) { console.error("Error fetching achievements:", error); } }
+        function renderAchievements() { if (!achievementsContainer) return; achievementsContainer.innerHTML = ''; if (appState.earnedAchievements.size === 0) { achievementsContainer.innerHTML = `<p class="text-slate-500 col-span-full">No achievements unlocked yet. Keep playing!</p>`; return; } appState.earnedAchievements.forEach(id => { const ach = ACHIEVEMENTS_LIST[id]; if (ach) { const el = document.createElement('div'); el.className = 'flex flex-col items-center text-center p-2 rounded-lg bg-slate-100'; el.innerHTML = `<div class="text-3xl mb-1">${ach.icon}</div><div class="text-xs font-semibold text-slate-700">${ach.title}</div>`; el.title = ach.text; achievementsContainer.appendChild(el); } }); }
+        function showCelebrationBanner(text, type) { if (!celebrationBanner) return; celebrationBanner.textContent = text; celebrationBanner.className = 'p-4 rounded-lg shadow-lg text-white font-bold text-lg'; const bannerTypeClass = type === 'premium' ? 'bg-purple-600' : 'bg-green-500'; celebrationBanner.classList.add(bannerTypeClass, 'show'); setTimeout(() => { celebrationBanner.classList.remove('show'); }, 3500); }
+
+        // --- Session Management ---
+        function saveStateToLocalStorage() { try { if (appState.roundData) { localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(appState)); } } catch (e) { console.error("Error saving state", e); } }
+        function loadStateFromLocalStorage() { try { const savedStateJSON = localStorage.getItem(LOCAL_STORAGE_KEY); if (savedStateJSON) { const savedState = JSON.parse(savedStateJSON); Object.assign(appState, savedState); appState.earnedAchievements = new Set(savedState.earnedAchievements || []); return true; } return false; } catch (e) { console.error("Error loading state", e); clearStateFromLocalStorage(); return false; } }
+        function clearStateFromLocalStorage() { localStorage.removeItem(LOCAL_STORAGE_KEY); }
+
+        // --- Core Application Logic ---
+        function showMessage(message, isError = false) { if (messageText && messageModal) { messageText.textContent = message; messageModal.className = 'fixed top-6 left-1/2 -translate-x-1/2 transition-all duration-300 ease-out p-4 rounded-lg shadow-lg border'; messageModal.classList.add('opacity-100', 'visible', 'translate-y-0', isError ? 'bg-red-100' : 'bg-green-100', isError ? 'border-red-400' : 'border-green-400'); if(messageText) messageText.className = `text-sm font-medium ${isError ? 'text-red-700' : 'text-green-700'}`; setTimeout(() => { if (messageModal) messageModal.classList.add('opacity-0', 'invisible', '-translate-y-5'); }, 4000); } }
+        function getExpectedStrokes(distance, lie) { let dataKey = lie.toLowerCase(); if (dataKey === 'fairway') dataKey = 'tee'; else if (dataKey === 'fringe' || dataKey === 'green') dataKey = 'putting'; else if (['recovery', 'penalty', 'other'].includes(dataKey)) dataKey = 'rough'; const table = expectedStrokesData[dataKey]; if (!table) { console.warn(`No expected strokes data for lie: ${lie}. Defaulting to rough.`); return 5; } const lookupDist = Math.round(distance); if (table[lookupDist] !== undefined) return table[lookupDist]; const availableDistances = Object.keys(table).map(Number); if (availableDistances.length === 0) return 5; const closestDist = availableDistances.reduce((prev, curr) => Math.abs(curr - lookupDist) < Math.abs(prev - lookupDist) ? curr : prev); return table[closestDist]; }
+        function calculateStrokesGained(esStart, esEnd, strokesTaken = 1, penalties = 0) { return parseFloat((esStart - esEnd - strokesTaken - penalties).toFixed(2)); }
+        function categorizeShot(shotNumber, startLie, startDist, holePar) { startLie = startLie.toLowerCase(); if (shotNumber === 1) return (holePar === 3) ? "APP" : "OTT"; if (startLie === 'green' || startLie === 'fringe') return "PUTT"; if (startDist <= 60) return "ARG"; return "APP"; }
+        function updateCurrentShotDisplay() { if (currentShotNumberDisplay) currentShotNumberDisplay.textContent = appState.currentShotNumber; if (currentHoleNumberDisplayClone) currentHoleNumberDisplayClone.textContent = appState.currentHoleNumber; if (currentShotStartLieDisplay) currentShotStartLieDisplay.textContent = appState.currentShotStartLie.toUpperCase(); if (currentShotStartDistanceDisplay) { const unit = (appState.currentShotStartLie === 'green' || appState.currentShotStartLie === 'fringe') ? "ft" : "yds"; currentShotStartDistanceDisplay.textContent = `${appState.currentShotStartDistance.toFixed(0)} ${unit}`; } if (shotDataForm) shotDataForm.reset(); const endDistInput = document.getElementById('shotEndDistance'); if (endDistInput) endDistInput.placeholder = "Enter distance"; const clubUsedInput = document.getElementById('shotClubUsed'); if (clubUsedInput) clubUsedInput.focus(); if (undoShotButton) { undoShotButton.classList.toggle('hidden', !(appState.currentHoleData && appState.currentHoleData.shots.length > 0)); } const isPutt = appState.currentShotStartLie === 'green' || appState.currentShotStartLie === 'fringe'; puttDetailsSection.classList.toggle('hidden', !isPutt); if (isPutt) { updatePuttDetailButtons(); } }
+        function startNewRound(event) { event.preventDefault(); const formData = new FormData(initialRoundSetupForm); const courseName = formData.get('roundCourseName').trim(); if (!courseName) { showMessage("Course Name is required.", true); return; } appState.roundData = { userId: currentUserId, date: formData.get('roundDate'), courseName: courseName, totalHolesToPlay: parseInt(formData.get('roundTotalHoles')), holes: [], createdAt: serverTimestamp() }; saveStateToLocalStorage(); restoreDataEntryUI(); }
+        function startNewHole(event) { event.preventDefault(); const formData = new FormData(holeInfoForm); const par = parseInt(formData.get('holeParInput')); const length = parseInt(formData.get('holeLengthInput')); if (isNaN(par) || isNaN(length) || par < 3 || par > 5 || length < 50 || length > 800) { showMessage("Invalid Par (3-5) or Hole Length (50-800 yds).", true); return; } appState.currentHoleData = { holeNumber: appState.currentHoleNumber, par: par, length: length, shots: [], score: 0, penaltiesThisHole: 0, sgOTT: 0, sgAPP: 0, sgARG: 0, sgPUTT: 0, totalSG: 0, approachedFromUnder130: false, tiger5_doubleBogeyOccurred: false, tiger5_bogeyPar5Occurred: false, tiger5_bogeyUnder130Occurred: false, tiger5_twoChipsOccurred: false, tiger5_threePuttOccurred: false }; appState.currentShotNumber = 1; appState.currentShotStartLie = 'tee'; appState.currentShotStartDistance = length; appState.currentHoleTotalStrokes = 0; appState.currentHolePenalties = 0; saveStateToLocalStorage(); restoreDataEntryUI(); }
+        function processShot(endDist, endLie, clubUsed, penaltiesThisShot) { try { if (!appState.currentHoleData) { showMessage("Error: No current hole data.", true); return; } const esStart = getExpectedStrokes(appState.currentShotStartDistance, appState.currentShotStartLie); let esEnd = getExpectedStrokes(endDist, endLie); if (endLie === 'green' && endDist === 0) { esEnd = 0; } const sgThisShot = calculateStrokesGained(esStart, esEnd, 1, penaltiesThisShot); const shotCategory = categorizeShot(appState.currentShotNumber, appState.currentShotStartLie, appState.currentShotStartDistance, appState.currentHoleData.par); if (shotCategory === "APP" || (shotCategory === "OTT" && appState.currentHoleData.par === 3)) { if (appState.currentShotStartDistance <= 130) { appState.currentHoleData.approachedFromUnder130 = true; } } if (!appState.currentHoleData.tiger5_twoChipsOccurred && appState.currentHoleData.shots.length > 0) { const lastShot = appState.currentHoleData.shots[appState.currentHoleData.shots.length - 1]; if (lastShot.category === 'ARG' && lastShot.endLie !== 'green' && shotCategory === 'ARG') { appState.currentHoleData.tiger5_twoChipsOccurred = true; } } const shotDetail = { shotNumber: appState.currentShotNumber, startLie: appState.currentShotStartLie, startDistance: appState.currentShotStartDistance, clubUsed: clubUsed, endLie: endLie, endDistance: endDist, penalties: penaltiesThisShot, sg: sgThisShot, category: shotCategory }; if (shotCategory === 'PUTT') { shotDetail.puttElevation = appState.currentPuttElevation; shotDetail.puttBreak = appState.currentPuttBreak; } appState.currentHoleData.shots.push(shotDetail); appState.currentHoleTotalStrokes += (1 + penaltiesThisShot); appState.currentHolePenalties += penaltiesThisShot; appState.currentHoleData[`sg${shotCategory}`] = (appState.currentHoleData[`sg${shotCategory}`] || 0) + sgThisShot; if (endLie === 'green' && endDist === 0) { if (shotEntrySection) shotEntrySection.classList.add('hidden'); if (finishHoleButton) finishHoleButton.classList.remove('hidden'); showMessage(`Hole finished in ${appState.currentHoleTotalStrokes} strokes.`, false); } else { appState.currentShotNumber++; appState.currentShotStartLie = endLie; appState.currentShotStartDistance = endDist; updateCurrentShotDisplay(); } saveStateToLocalStorage(); } catch (error) { console.error("Error processing shot:", error); showMessage("A calculation error occurred. Please check your inputs.", true); } }
+        function addShot(event) { event.preventDefault(); const formData = new FormData(shotDataForm); let endDist = parseFloat(formData.get('shotEndDistance')); const endLie = formData.get('shotEndLie').toLowerCase(); const clubUsed = formData.get('shotClubUsed'); const penaltiesThisShot = parseInt(formData.get('shotPenalties')) || 0; if (isNaN(endDist) || !endLie) { showMessage("Please enter valid End Distance and End Lie.", true); return; } processShot(endDist, endLie, clubUsed, penaltiesThisShot); }
+        function handleHoledOut() { processShot(0, 'green', document.getElementById('shotClubUsed').value, 0); }
+        function undoLastShot() { if (!appState.currentHoleData || appState.currentHoleData.shots.length === 0) { showMessage("Nothing to undo.", true); return; } const undoneShot = appState.currentHoleData.shots.pop(); appState.currentShotNumber = undoneShot.shotNumber; appState.currentShotStartLie = undoneShot.startLie; appState.currentShotStartDistance = undoneShot.startDistance; appState.currentHoleTotalStrokes -= (1 + undoneShot.penalties); appState.currentHolePenalties -= undoneShot.penalties; appState.currentHoleData[`sg${undoneShot.category}`] -= undoneShot.sg; if (shotEntrySection) shotEntrySection.classList.remove('hidden'); updateCurrentShotDisplay(); if (finishHoleButton) finishHoleButton.classList.add('hidden'); showMessage("Last shot undone.", false); saveStateToLocalStorage(); }
+        async function finishHole() { if (!appState.currentHoleData) { showMessage("Error: No hole data to finish.", true); return; } appState.currentHoleData.score = appState.currentHoleTotalStrokes; const scoreVsPar = appState.currentHoleData.score - appState.currentHoleData.par; if (scoreVsPar === -1) { showCelebrationBanner(' BIRDIE!', 'success'); } else if (scoreVsPar === -2) { showCelebrationBanner(' EAGLE!', 'premium'); } else if (scoreVsPar <= -3) { showCelebrationBanner(' ALBATROSS!', 'premium'); } appState.currentHoleData.totalSG = parseFloat(appState.currentHoleData.shots.reduce((sum, shot) => sum + shot.sg, 0).toFixed(2)); ['sgOTT', 'sgAPP', 'sgARG', 'sgPUTT'].forEach(cat => { appState.currentHoleData[cat] = parseFloat((appState.currentHoleData[cat] || 0).toFixed(2)); }); if (appState.currentHoleData.score >= appState.currentHoleData.par + 2) { appState.currentHoleData.tiger5_doubleBogeyOccurred = true; } if (appState.currentHoleData.par === 5 && appState.currentHoleData.score >= 6) { appState.currentHoleData.tiger5_bogeyPar5Occurred = true; } if (appState.currentHoleData.approachedFromUnder130 && appState.currentHoleData.score >= appState.currentHoleData.par + 1) { appState.currentHoleData.tiger5_bogeyUnder130Occurred = true; } if (appState.currentHoleData.tiger5_twoChipsOccurred) { appState.roundData.tiger5_twoChips_count = (appState.roundData.tiger5_twoChips_count || 0) + 1; } const puttsOnThisHole = appState.currentHoleData.shots.filter(s => s.category === 'PUTT').length; if (puttsOnThisHole >= 3) { appState.currentHoleData.tiger5_threePuttOccurred = true; } appState.roundData.holes.push(appState.currentHoleData); if (appState.currentHoleNumber < appState.roundData.totalHolesToPlay) { appState.currentHoleNumber++; appState.currentHoleData = null; restoreDataEntryUI(); } else { if (holeSetupSection) holeSetupSection.classList.add('hidden'); if (shotEntrySection) shotEntrySection.classList.add('hidden'); if (finishHoleButton) finishHoleButton.classList.add('hidden'); if (finishRoundButton) finishRoundButton.classList.remove('hidden'); showMessage("All holes entered. Click 'Finish Round & Save'.", false); } saveStateToLocalStorage(); }
+        async function finishRoundAndSave() {
+            if (!appState.roundData || appState.roundData.holes.length === 0) { showMessage("No round data to save.", true); return; }
+            if (loadingIndicator) loadingIndicator.classList.remove('hidden');
+            const round = appState.roundData;
+            round.totalScore = round.holes.reduce((sum, hole) => sum + hole.score, 0);
+            const holeStats = round.holes.reduce((acc, hole) => { acc.totalSG_OTT += hole.sgOTT || 0; acc.totalSG_APP += hole.sgAPP || 0; acc.totalSG_ARG += hole.sgARG || 0; acc.totalSG_PUTT += hole.sgPUTT || 0; if(hole.tiger5_doubleBogeyOccurred) acc.tiger5_doubleBogeys_count++; if(hole.tiger5_bogeyPar5Occurred) acc.tiger5_bogeyPar5s_count++; if(hole.tiger5_bogeyUnder130Occurred) acc.tiger5_bogeyUnder130_count++; if(hole.tiger5_threePuttOccurred) acc.tiger5_threePutts_count++; return acc; }, { totalSG_OTT: 0, totalSG_APP: 0, totalSG_ARG: 0, totalSG_PUTT: 0, tiger5_doubleBogeys_count: 0, tiger5_bogeyPar5s_count: 0, tiger5_bogeyUnder130_count: 0, tiger5_threePutts_count: 0 });
+            Object.assign(round, holeStats, { tiger5_twoChips_count: round.tiger5_twoChips_count || 0 });
+            round.totalSG = round.totalSG_OTT + round.totalSG_APP + round.totalSG_ARG + round.totalSG_PUTT;
+            round.tiger5_total_count = round.tiger5_doubleBogeys_count + round.tiger5_bogeyPar5s_count + round.tiger5_bogeyUnder130_count + round.tiger5_twoChips_count + round.tiger5_threePutts_count;
+            ['totalSG', 'totalSG_OTT', 'totalSG_APP', 'totalSG_ARG', 'totalSG_PUTT'].forEach(key => { round[key] = parseFloat(round[key].toFixed(2)); });
+            const allRoundsData = await fetchAllRoundsSummary();
+            await checkAndAwardAchievements(round, allRoundsData);
+            const courseLayout = { courseName: round.courseName, holes: round.holes.map(h => ({ holeNumber: h.holeNumber, par: h.par, length: h.length })) };
+            const courseDocId = round.courseName.toLowerCase().replace(/\s+/g, '-');
+            try {
+                const collectionPath = `artifacts/${firestorePathIdentifier}/users/${currentUserId}/golfRoundsShotByShot`;
+                const batch = writeBatch(db);
+                const { holes, ...roundSummaryData } = round;
+                const newRoundRef = doc(collection(db, collectionPath));
+                batch.set(newRoundRef, roundSummaryData);
+                for (const hole of holes) {
+                    const holeDocRef = doc(db, `${collectionPath}/${newRoundRef.id}/holes`, hole.holeNumber.toString());
+                    const { shots, ...holeSummaryData } = hole;
+                    batch.set(holeDocRef, holeSummaryData);
+                    for (const shot of shots) {
+                        const shotDocRef = doc(db, `${collectionPath}/${newRoundRef.id}/holes/${hole.holeNumber}/shots`, shot.shotNumber.toString());
+                        batch.set(shotDocRef, shot);
+                    }
+                }
+                batch.set(doc(db, `users/${currentUserId}/courses`, courseDocId), courseLayout, { merge: true });
+                await batch.commit();
+                showMessage("Round saved successfully!", false);
+                clearStateFromLocalStorage();
+                resetEntireAppUI();
+                switchPage('dashboard');
+            } catch (error) { console.error(error); showMessage("Error saving round: " + error.message, true); } finally { if (loadingIndicator) loadingIndicator.classList.add('hidden'); }
+        }
+        function resetEntireAppUI() { Object.keys(appState).forEach(key => { if(!['knownCourses','earnedAchievements'].includes(key)) appState[key] = null; }); Object.assign(appState, { currentHoleNumber: 1, currentShotNumber: 1, currentShotStartLie: 'tee', currentShotStartDistance: 0, currentHoleTotalStrokes: 0, currentHolePenalties: 0 }); if (initialRoundSetupForm) { initialRoundSetupForm.reset(); initialRoundSetupForm.classList.remove('hidden'); } if(roundDateInput) roundDateInput.value = new Date().toISOString().split('T')[0]; if (holeSetupSection) holeSetupSection.classList.add('hidden'); if (shotEntrySection) shotEntrySection.classList.add('hidden'); if (finishRoundButton) finishRoundButton.classList.add('hidden'); if (finishHoleButton) finishHoleButton.classList.add('hidden'); if (holeInfoForm) holeInfoForm.reset(); if (shotDataForm) shotDataForm.reset(); if (currentHoleNumberDisplay) currentHoleNumberDisplay.textContent = '1'; const holeNumDispButton = document.getElementById('currentHoleNumberDisplayForButton'); if (holeNumDispButton) holeNumDispButton.textContent = '1'; if (currentHoleNumberDisplayClone) currentHoleNumberDisplayClone.textContent = '1'; }
+        function restoreDataEntryUI() { if (!appState.roundData) { resetEntireAppUI(); return; } if (initialRoundSetupForm) initialRoundSetupForm.classList.add('hidden'); if (!appState.currentHoleData) { if (holeSetupSection) holeSetupSection.classList.remove('hidden'); if (shotEntrySection) shotEntrySection.classList.add('hidden'); const holeNumInput = document.getElementById('holeNumberInput'); if (holeNumInput) holeNumInput.value = appState.currentHoleNumber; if (currentHoleNumberDisplay) currentHoleNumberDisplay.textContent = appState.currentHoleNumber; const holeNumDispButton = document.getElementById('currentHoleNumberDisplayForButton'); if (holeNumDispButton) holeNumDispButton.textContent = appState.currentHoleNumber; const courseName = appState.roundData.courseName; const holeParInput = document.getElementById('holeParInput'); const holeLengthInput = document.getElementById('holeLengthInput'); if (appState.knownCourses[courseName]) { const holeInfo = appState.knownCourses[courseName].holes.find(h => h.holeNumber === appState.currentHoleNumber); if (holeInfo) { holeParInput.value = holeInfo.par; holeLengthInput.value = holeInfo.length; } else { holeParInput.value = ''; holeLengthInput.value = ''; } } else { holeParInput.value = ''; holeLengthInput.value = ''; } if (holeParInput) holeParInput.focus(); } else { if (holeSetupSection) holeSetupSection.classList.add('hidden'); if (shotEntrySection) shotEntrySection.classList.remove('hidden'); updateCurrentShotDisplay(); } }
+        function destroyCharts() { Object.values(chartInstances).forEach(chart => { if (chart) chart.destroy(); }); chartInstances = {}; const svgContainer = document.getElementById('sgProfileSvgContainer'); if (svgContainer) svgContainer.innerHTML = ''; }
+        function setAttributes(el, attrs) { for (const key in attrs) { el.setAttribute(key, attrs[key]); } }
+        function renderSgProfileSvg(avgData) { const container = document.getElementById('sgProfileSvgContainer'); if (!container) return; container.innerHTML = ''; const svgNS = "http://www.w3.org/2000/svg"; const svg = document.createElementNS(svgNS, "svg"); setAttributes(svg, { 'viewBox': '0 0 300 300', 'class': 'w-full h-full' }); const center = { x: 150, y: 150 }; const maxRadius = 110; const mapSgToScale = (sg) => { const clampedSg = Math.max(-2, Math.min(2, sg || 0)); return 1 + (clampedSg / 2.0) * 0.75; }; const baseRadius = maxRadius * (1 / 1.75); const gridGroup = document.createElementNS(svgNS, 'g'); const labels = [ { text: 'Off the Tee', x: center.x, y: center.y - maxRadius - 15, anchor: 'middle' }, { text: 'Approach', x: center.x + maxRadius + 10, y: center.y, anchor: 'start' }, { text: 'Around Green', x: center.x, y: center.y + maxRadius + 20, anchor: 'middle' }, { text: 'Putting', x: center.x - maxRadius - 10, y: center.y, anchor: 'end' }]; const lineAttr = { 'stroke': '#e2e8f0', 'stroke-width': '1' }; const horizLine = document.createElementNS(svgNS, 'line'); setAttributes(horizLine, { x1: 20, y1: center.y, x2: 280, y2: center.y, ...lineAttr }); const vertLine = document.createElementNS(svgNS, 'line'); setAttributes(vertLine, { x1: center.x, y1: 20, x2: center.x, y2: 280, ...lineAttr }); const baselineSquare = document.createElementNS(svgNS, 'polygon'); const basePoints = [ `${center.x},${center.y - baseRadius}`, `${center.x + baseRadius},${center.y}`, `${center.x},${center.y + baseRadius}`, `${center.x - baseRadius},${center.y}` ].join(' '); setAttributes(baselineSquare, { points: basePoints, 'fill': 'none', 'stroke': '#cbd5e1', 'stroke-width': '1.5', 'stroke-dasharray': '3 3' }); gridGroup.append(horizLine, vertLine, baselineSquare); labels.forEach(label => { const text = document.createElementNS(svgNS, 'text'); setAttributes(text, { x: label.x, y: label.y, 'text-anchor': label.anchor, 'dominant-baseline': 'middle', 'fill': '#475569', 'font-size': '14', 'font-weight': '600' }); text.textContent = label.text; gridGroup.appendChild(text); }); svg.appendChild(gridGroup); const scaledRadius = { ott: baseRadius * mapSgToScale(avgData.OTT), app: baseRadius * mapSgToScale(avgData.APP), arg: baseRadius * mapSgToScale(avgData.ARG), putt: baseRadius * mapSgToScale(avgData.PUTT) }; const profilePoints = [ `${center.x},${center.y - scaledRadius.ott}`, `${center.x + scaledRadius.app},${center.y}`, `${center.x},${center.y + scaledRadius.arg}`, `${center.x - scaledRadius.putt},${center.y}` ].join(' '); const profilePolygon = document.createElementNS(svgNS, 'polygon'); setAttributes(profilePolygon, { points: profilePoints, 'fill': 'rgba(37, 99, 235, 0.25)', 'stroke': 'rgb(37, 99, 235)', 'stroke-width': '2.5', 'stroke-linejoin': 'round' }); svg.appendChild(profilePolygon); container.appendChild(svg); }
+        function renderPerformanceTrendChart(rounds) { const ctx = document.getElementById('performanceTrendChart'); if (!ctx) return; const labels = rounds.map(r => r.date); const sgData = rounds.map(r => { const sg = r.totalSG || 0; return r.totalHolesToPlay === 9 ? sg * 2 : sg; }); chartInstances.performanceTrend = new Chart(ctx, { type: 'line', data: { labels: labels, datasets: [{ label: 'Total Strokes Gained per Round', data: sgData, borderColor: '#2563eb', backgroundColor: 'rgba(37, 99, 235, 0.1)', fill: true, tension: 0.1, borderWidth: 2, pointBackgroundColor: '#2563eb' }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: false, grid: { color: '#e2e8f0' } }, x: { grid: { display: false } } }, plugins: { legend: { display: false }, title: { display: true, text: 'Overall Performance Trend (18-Hole Normalized)', font: { size: 16, weight: '600' }, color: '#1e293b', padding: { bottom: 20 } } } } }); }
+        function renderSgBreakdownChart(rounds) { const ctx = document.getElementById('sgBreakdownChart'); if (!ctx || rounds.length === 0) return; const totalHolesPlayed = rounds.reduce((sum, r) => sum + (r.totalHolesToPlay || 18), 0); if(totalHolesPlayed === 0) return; const getNormalizedAvg = (key) => (rounds.reduce((sum, r) => sum + (r[key] || 0), 0) / totalHolesPlayed) * 18; chartInstances.sgBreakdown = new Chart(ctx, { type: 'bar', data: { labels: ['Off the Tee', 'Approach', 'Around Green', 'Putting'], datasets: [{ label: 'Average Strokes Gained', data: [getNormalizedAvg('totalSG_OTT'), getNormalizedAvg('totalSG_APP'), getNormalizedAvg('totalSG_ARG'), getNormalizedAvg('totalSG_PUTT')], backgroundColor: (c) => c.dataset.data[c.dataIndex] >= 0 ? 'rgba(5, 150, 105, 0.7)' : 'rgba(220, 38, 38, 0.7)', borderColor: (c) => c.dataset.data[c.dataIndex] >= 0 ? 'rgba(5, 150, 105, 1)' : 'rgba(220, 38, 38, 1)', borderWidth: 1 }] }, options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, scales: { x: { grid: { color: '#e2e8f0' }, title: { display: true, text: 'Strokes Gained (per 18 Holes)' } }, y: { grid: { display: false } } }, plugins: { legend: { display: false }, title: { display: true, text: 'Average SG by Category', font: { size: 16, weight: '600' }, color: '#1e293b', padding: { bottom: 20 } } } } }); }
+        function renderTiger5Chart(rounds) { const ctx = document.getElementById('tiger5Chart'); if (!ctx || rounds.length === 0) return; const totalHolesPlayed = rounds.reduce((sum, r) => sum + (r.totalHolesToPlay || 18), 0); if(totalHolesPlayed === 0) return; const getNormalizedAvg = (key) => (rounds.reduce((sum, r) => sum + (r[key] || 0), 0) / totalHolesPlayed) * 18; chartInstances.tiger5 = new Chart(ctx, { type: 'bar', data: { labels: ['Dbl Bogey+', 'Bogey on P5', 'Bogey <130', '2+ Chips', '3-Putts+'], datasets: [{ label: 'Average Occurrences per Round', data: [getNormalizedAvg('tiger5_doubleBogeys_count'), getNormalizedAvg('tiger5_bogeyPar5s_count'), getNormalizedAvg('tiger5_bogeyUnder130_count'), getNormalizedAvg('tiger5_twoChips_count'), getNormalizedAvg('tiger5_threePutts_count')], backgroundColor: 'rgba(217, 119, 6, 0.7)', borderColor: 'rgba(217, 119, 6, 1)', borderWidth: 1 }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, grid: { color: '#e2e8f0' }, title: { display: true, text: 'Avg per 18 Holes' } }, x: { grid: { display: false } } }, plugins: { legend: { display: false }, title: { display: true, text: '"Tiger 5" Mistake Frequency', font: { size: 16, weight: '600' }, color: '#1e293b', padding: { bottom: 20 } } } } }); }
+        function renderApproachYardageChart(allShots) {
+            const ctx = document.getElementById('approachYardageChart');
+            if (!ctx) return;
+            const approachShots = allShots.filter(shot => shot.category === 'APP');
+            // UPDATED: Added the <100 yardage bucket
+            const yardageBuckets = {
+                '<100':     { totalSg: 0, count: 0 },
+                '100-125': { totalSg: 0, count: 0 },
+                '126-150': { totalSg: 0, count: 0 },
+                '151-175': { totalSg: 0, count: 0 },
+                '176-200': { totalSg: 0, count: 0 },
+                '201+':    { totalSg: 0, count: 0 }
+            };
+
+            for (const shot of approachShots) {
+                const dist = shot.startDistance;
+                // UPDATED: Added logic to categorize shots under 100 yards
+                if (dist < 100) { yardageBuckets['<100'].totalSg += shot.sg; yardageBuckets['<100'].count++; }
+                else if (dist >= 100 && dist <= 125) { yardageBuckets['100-125'].totalSg += shot.sg; yardageBuckets['100-125'].count++; }
+                else if (dist >= 126 && dist <= 150) { yardageBuckets['126-150'].totalSg += shot.sg; yardageBuckets['126-150'].count++; }
+                else if (dist >= 151 && dist <= 175) { yardageBuckets['151-175'].totalSg += shot.sg; yardageBuckets['151-175'].count++; }
+                else if (dist >= 176 && dist <= 200) { yardageBuckets['176-200'].totalSg += shot.sg; yardageBuckets['176-200'].count++; }
+                else if (dist >= 201) { yardageBuckets['201+'].totalSg += shot.sg; yardageBuckets['201+'].count++; }
+            }
+
+            const labels = Object.keys(yardageBuckets);
+            const data = labels.map(bucket => { const { totalSg, count } = yardageBuckets[bucket]; return count > 0 ? (totalSg / count).toFixed(2) : 0; });
+            
+            chartInstances.approachYardage = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels.map(label => `${label} yds`),
+                    datasets: [{ label: 'Average Strokes Gained', data: data, backgroundColor: (c) => c.dataset.data[c.dataIndex] >= 0 ? 'rgba(34, 197, 94, 0.7)' : 'rgba(239, 68, 68, 0.7)', borderColor: (c) => c.dataset.data[c.dataIndex] >= 0 ? 'rgba(22, 163, 74, 1)' : 'rgba(220, 38, 38, 1)', borderWidth: 1 }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    scales: { y: { grid: { color: '#e2e8f0' }, title: { display: true, text: 'Average Strokes Gained per Shot' } }, x: { grid: { display: false } } },
+                    plugins: { legend: { display: false }, title: { display: true, text: 'Approach Performance by Yardage', font: { size: 16, weight: '600' }, color: '#1e293b', padding: { bottom: 20 } },
+                        tooltip: { callbacks: { label: function(context) { const bucketKey = labels[context.dataIndex]; const shotCount = yardageBuckets[bucketKey].count; let label = `Avg SG: ${context.formattedValue}`; if (shotCount > 0) { label += ` (${shotCount} shots)`; } return label; } } }
+                    }
+                }
+            });
+        }
+        function displayRounds(roundsData) { if (!roundsTableBody) return; roundsTableBody.innerHTML = ''; if (roundsData.length === 0) { roundsTableBody.innerHTML = '<tr><td colspan="15" class="text-center py-4">No rounds recorded yet. Go play!</td></tr>'; return; } roundsData.forEach(round => { const row = roundsTableBody.insertRow(); row.className = 'hover:bg-slate-50 transition-colors'; const formatNum = (num, dec = 2) => (num !== undefined && num !== null) ? num.toFixed(dec) : 'N/A'; const formatColor = (num) => (num >= 0) ? 'text-green-600' : 'text-red-600'; row.innerHTML = `<td class="px-3 py-3.5 border-b border-slate-200 text-xs whitespace-nowrap">${round.date}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs truncate" style="max-width: 120px;">${round.courseName}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center">${round.totalScore} (${round.totalHolesToPlay}h)</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center font-semibold ${formatColor(round.totalSG)}">${formatNum(round.totalSG)}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center ${formatColor(round.totalSG_OTT)}">${formatNum(round.totalSG_OTT)}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center ${formatColor(round.totalSG_APP)}">${formatNum(round.totalSG_APP)}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center ${formatColor(round.totalSG_ARG)}">${formatNum(round.totalSG_ARG)}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center ${formatColor(round.totalSG_PUTT)}">${formatNum(round.totalSG_PUTT)}</td><td class="px-2 py-3.5 border-b border-slate-200 text-xs text-center">${round.tiger5_doubleBogeys_count || 0}</td><td class="px-2 py-3.5 border-b border-slate-200 text-xs text-center">${round.tiger5_bogeyPar5s_count || 0}</td><td class="px-2 py-3.5 border-b border-slate-200 text-xs text-center">${round.tiger5_bogeyUnder130_count || 0}</td><td class="px-2 py-3.5 border-b border-slate-200 text-xs text-center">${round.tiger5_twoChips_count || 0}</td><td class="px-2 py-3.5 border-b border-slate-200 text-xs text-center">${round.tiger5_threePutts_count || 0}</td><td class="px-2 py-3.5 border-b border-slate-200 text-xs text-center font-semibold text-red-700">${round.tiger5_total_count || 0}</td><td class="px-3 py-3.5 border-b border-slate-200 text-xs text-center"><button data-id="${round.id}" class="delete-round-btn text-slate-400 hover:text-red-600 p-1 rounded-full hover:bg-red-100"><svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"></path></svg></button></td>`; }); document.querySelectorAll('.delete-round-btn').forEach(button => button.addEventListener('click', handleDeleteRound)); }
+        async function handleDeleteRound(event) { const roundId = event.currentTarget.dataset.id; if (!confirm(`Are you sure you want to delete this round data? This cannot be undone.`)) return; if(loadingIndicator) loadingIndicator.classList.remove('hidden'); try { const collectionPath = `artifacts/${firestorePathIdentifier}/users/${currentUserId}/golfRoundsShotByShot`; const holesCollectionRef = collection(db, `${collectionPath}/${roundId}/holes`); const holesSnapshot = await getDocs(holesCollectionRef); const batch = writeBatch(db); for (const holeDoc of holesSnapshot.docs) { const shotsCollectionRef = collection(db, `${collectionPath}/${roundId}/holes/${holeDoc.id}/shots`); const shotsSnapshot = await getDocs(shotsCollectionRef); shotsSnapshot.forEach(shotDoc => batch.delete(shotDoc.ref)); batch.delete(holeDoc.ref); } batch.delete(doc(db, collectionPath, roundId)); await batch.commit(); showMessage("Round deleted successfully.", false); fetchAndDisplayDashboardData(); } catch (error) { showMessage("Error deleting round: " + error.message, true); } finally { if(loadingIndicator) loadingIndicator.classList.add('hidden'); } }
+        function calculateAndDisplayOverallSummary(rounds) { if (!statsSummary) return; if (rounds.length === 0) { statsSummary.innerHTML = '<p class="text-center text-slate-500">No data for summary.</p>'; renderSgProfileSvg({OTT:0,APP:0,ARG:0,PUTT:0}); return; } const totalHolesPlayed = rounds.reduce((sum, r) => sum + (r.totalHolesToPlay || 18), 0); if (totalHolesPlayed === 0) return;  const getNormalizedAvg = (key, dec=2) => ((rounds.reduce((sum, r) => sum + (r[key] || 0), 0) / totalHolesPlayed) * 18).toFixed(dec); const avgData = { score: getNormalizedAvg('totalScore', 1), sg: getNormalizedAvg('totalSG'), ott: getNormalizedAvg('totalSG_OTT'), app: getNormalizedAvg('totalSG_APP'), arg: getNormalizedAvg('totalSG_ARG'), putt: getNormalizedAvg('totalSG_PUTT'), t5Double: getNormalizedAvg('tiger5_doubleBogeys_count', 1), t5Par5: getNormalizedAvg('tiger5_bogeyPar5s_count', 1), t5Under130: getNormalizedAvg('tiger5_bogeyUnder130_count', 1), t5TwoChip: getNormalizedAvg('tiger5_twoChips_count', 1), t5ThreePutt: getNormalizedAvg('tiger5_threePutts_count', 1), t5Total: getNormalizedAvg('tiger5_total_count', 1) }; const createStat = (label, value, isGood, isTiger = false) => { const valClass = isGood === null ? 'text-blue-600' : (isGood ? 'text-green-600' : 'text-red-600'); const cardClass = isTiger ? 'bg-amber-50 border border-amber-200' : 'stat-card'; const labelClass = isTiger ? 'text-amber-800' : 'stat-card-label'; const valueClass = isTiger ? 'text-amber-900' : valClass; return `<div class="${cardClass}"><span class="${labelClass}">${label}</span> <span class="stat-card-value ${valueClass}">${value}</span></div>`; };  statsSummary.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4"> ${createStat('Avg Score', avgData.score, null)} ${createStat('Avg SG Total', avgData.sg, avgData.sg >= 0)} ${createStat('Avg SG:OTT', avgData.ott, avgData.ott >= 0)} ${createStat('Avg SG:APP', avgData.app, avgData.app >= 0)} ${createStat('Avg SG:ARG', avgData.arg, avgData.arg >= 0)} ${createStat('Avg SG:PUTT', avgData.putt, avgData.putt >= 0)} </div>`; const tiger5Summary = document.getElementById('tiger5Summary'); if (tiger5Summary) { tiger5Summary.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-3 gap-4"> ${createStat('Avg Dbl Bogey+', avgData.t5Double, false, true)} ${createStat('Avg Bogey on P5', avgData.t5Par5, false, true)} ${createStat('Avg Bogey &lt;130', avgData.t5Under130, false, true)} ${createStat('Avg 2+ Chips', avgData.t5TwoChip, false, true)} ${createStat('Avg 3-Putts+', avgData.t5ThreePutt, false, true)} <div class="stat-card bg-red-100 border border-red-200"><span class="stat-card-label text-red-800">Avg Tiger 5 Total</span> <span class="stat-card-value text-red-900">${avgData.t5Total}</span></div> </div>`; } renderSgProfileSvg({ OTT: +avgData.ott, APP: +avgData.app, ARG: +avgData.arg, PUTT: +avgData.putt }); }
+        function calculateAndDisplayPuttingSummary(allShots) { if (!puttingStatsSummary) return; const putts = allShots.filter(s => s.category === 'PUTT' && s.puttElevation && s.puttBreak); if (putts.length < 10) { puttingStatsSummary.innerHTML = '<p class="text-center text-slate-500 py-4">Not enough detailed putting data yet.</p>'; return; } const getPuttStat = (data, filterFn, label) => { const filteredPutts = data.filter(filterFn); if (filteredPutts.length === 0) return ''; const avgSg = filteredPutts.reduce((sum, p) => sum + p.sg, 0) / filteredPutts.length; const valClass = avgSg >= 0 ? 'text-green-600' : 'text-red-600'; return `<div class="stat-card"><span class="stat-card-label">${label} (${filteredPutts.length})</span> <span class="stat-card-value text-base ${valClass}">${avgSg.toFixed(2)}</span></div>`; }; puttingStatsSummary.innerHTML = `<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4"> ${getPuttStat(putts, p => p.puttElevation === 'uphill', 'SG: Uphill')} ${getPuttStat(putts, p => p.puttElevation === 'downhill', 'SG: Downhill')} ${getPuttStat(putts, p => p.puttElevation === 'flat', 'SG: Flat')} ${getPuttStat(putts, p => p.puttBreak === 'left-to-right', 'SG: L-to-R')} ${getPuttStat(putts, p => p.puttBreak === 'right-to-left', 'SG: R-to-L')} </div>`; }
+        async function fetchAllRoundsSummary() { if (!currentUserId) return []; const collectionPath = `artifacts/${firestorePathIdentifier}/users/${currentUserId}/golfRoundsShotByShot`; const rounds = []; const q = query(collection(db, collectionPath), orderBy("date", "desc")); const querySnapshot = await getDocs(q); querySnapshot.forEach(doc => rounds.push({ id: doc.id, ...doc.data() })); return rounds; }
+        async function fetchAndDisplayDashboardData() {
+            if (!currentUserId || !db) return;
+            if(loadingIndicator) loadingIndicator.classList.remove('hidden');
+            const collectionPath = `artifacts/${firestorePathIdentifier}/users/${currentUserId}/golfRoundsShotByShot`;
+            try {
+                const q = query(collection(db, collectionPath), orderBy("date", "desc"));
+                const querySnapshot = await getDocs(q);
+                const rounds = []; 
+                const allShots = [];
+                for (const roundDoc of querySnapshot.docs) {
+                    rounds.push({ id: roundDoc.id, ...roundDoc.data() });
+                    const holesSnapshot = await getDocs(collection(db, `${collectionPath}/${roundDoc.id}/holes`));
+                    for (const holeDoc of holesSnapshot.docs) {
+                        const shotsSnapshot = await getDocs(collection(db, `${collectionPath}/${roundDoc.id}/holes/${holeDoc.id}/shots`));
+                        shotsSnapshot.forEach(shotDoc => allShots.push(shotDoc.data()));
+                    }
+                }
+                const sortedRoundsForTrend = [...rounds].sort((a,b) => new Date(a.date) - new Date(b.date));
+                destroyCharts();
+                displayRounds(rounds);
+                calculateAndDisplayOverallSummary(rounds);
+                calculateAndDisplayPuttingSummary(allShots);
+                renderPerformanceTrendChart(sortedRoundsForTrend);
+                renderSgBreakdownChart(rounds);
+                renderTiger5Chart(rounds);
+                renderApproachYardageChart(allShots);
+                renderAchievements();
+            } catch (error) { showMessage("Error fetching dashboard data: " + error.message, true); displayRounds([]); calculateAndDisplayOverallSummary([]); console.error(error);
+            } finally { if(loadingIndicator) loadingIndicator.classList.add('hidden'); }
+        }
+        function switchPage(page) {
+            destroyCharts();
+            const isDashboard = page === 'dashboard';
+            if (pageDashboard) pageDashboard.classList.toggle('hidden', !isDashboard);
+            if (pageDataEntry) pageDataEntry.classList.toggle('hidden', isDashboard);
+            if (navLinkDashboard) navLinkDashboard.classList.toggle('active', isDashboard);
+            if (navLinkDataEntry) navLinkDataEntry.classList.toggle('active', !isDashboard);
+            if (isDashboard) { fetchAndDisplayDashboardData(); } else { restoreDataEntryUI(); }
+        }
+        async function init() {
+            try {
+                const firebaseConfig = {
+                    apiKey: "AIzaSyBstdRCa1aajnFxxdLv39SvKdn20_SyaA4",
+                    authDomain: "pga-tour-stats-e863f.firebaseapp.com",
+                    projectId: "pga-tour-stats-e863f",
+                    storageBucket: "pga-tour-stats-e863f.appspot.com",
+                    messagingSenderId: "188591537756",
+                    appId: "1:188591537756:web:eac9bdbd6dcb440ec8b099",
+                    measurementId: "G-03GPM5ZNH0"
+                };
+                firestorePathIdentifier = firebaseConfig.projectId;
+                app = initializeApp(firebaseConfig); 
+                auth = getAuth(app); 
+                db = getFirestore(app); 
+                analytics = getAnalytics(app);
+                assignUIElements(); 
+                addEventListeners();
+                expectedStrokesData = getLocalStrokesGainedData();
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        currentUserId = user.uid;
+                        if(userIdDisplay) userIdDisplay.textContent = `User ID: ${currentUserId.substring(0,8)}...`;
+                        try {
+                            await fetchEarnedAchievements();
+                            await fetchKnownCourses();
+                            if (loadStateFromLocalStorage()) { if (resumeSessionModal) resumeSessionModal.classList.remove('hidden'); } 
+                            else { switchPage('dashboard'); }
+                        } catch (error) {
+                            console.error("Critical error during post-auth setup:", error);
+                            showMessage("Could not load user data. Please refresh.", true);
+                        }
+                    } else {
+                        currentUserId = null; 
+                        if(userIdDisplay) userIdDisplay.textContent = "Not signed in"; 
+                        resetEntireAppUI(); 
+                        if(roundsTableBody) roundsTableBody.innerHTML = '<tr><td colspan="15" class="text-center py-4">Please sign in.</td></tr>'; 
+                        if(statsSummary) statsSummary.innerHTML = '<p class="text-center text-slate-500">Please sign in.</p>'; 
+                        if(loadingIndicator) loadingIndicator.classList.remove('hidden');
+                        try { await signInAnonymously(auth); } catch (e) { showMessage("Could not sign in. Data features disabled.", true); } finally { if(loadingIndicator) loadingIndicator.classList.add('hidden'); }
+                    }
+                });
+            } catch (error) { showMessage("Error initializing application: " + error.message, true); console.error("Init error: ", error); }
+        }
+        function addEventListeners() {
+            navLinkDashboard.addEventListener('click', () => switchPage('dashboard'));
+            navLinkDataEntry.addEventListener('click', () => switchPage('data-entry'));
+            resumeSessionButton.addEventListener('click', () => { resumeSessionModal.classList.add('hidden'); switchPage('data-entry'); });
+            discardSessionButton.addEventListener('click', () => { resumeSessionModal.classList.add('hidden'); clearStateFromLocalStorage(); resetEntireAppUI(); switchPage('dashboard'); });
+            initialRoundSetupForm.addEventListener('submit', startNewRound);
+            holeInfoForm.addEventListener('submit', startNewHole);
+            shotDataForm.addEventListener('submit', addShot);
+            finishHoleButton.addEventListener('click', finishHole);
+            finishRoundButton.addEventListener('click', finishRoundAndSave);
+            holedOutButton.addEventListener('click', handleHoledOut);
+            undoShotButton.addEventListener('click', undoLastShot);
+            recalculateRoundsButton.addEventListener('click', () => showMessage("Recalculation is a complex, server-side operation not implemented in this version.", false));
+            closeMessageModalButton.addEventListener('click', () => messageModal.classList.add('opacity-0', '-translate-y-5'));
+            closeGamificationModalButton.addEventListener('click', () => gamificationModal.classList.add('hidden'));
+            document.querySelectorAll('.putt-detail-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const parent = e.target.closest('div[data-type]');
+                    const type = parent.dataset.type;
+                    const value = e.target.dataset.value;
+                    if (type === 'elevation') appState.currentPuttElevation = value;
+                    else if (type === 'break') appState.currentPuttBreak = value;
+                    updatePuttDetailButtons();
+                });
+            });
+        }
+        async function fetchKnownCourses() { if (!currentUserId) return; const coursesRef = collection(db, `users/${currentUserId}/courses`); const snapshot = await getDocs(coursesRef); appState.knownCourses = {}; courseDatalist.innerHTML = ''; snapshot.forEach(doc => { const courseData = doc.data(); appState.knownCourses[courseData.courseName] = courseData; const option = document.createElement('option'); option.value = courseData.courseName; courseDatalist.appendChild(option); }); }
+        function updatePuttDetailButtons() { document.querySelectorAll('.putt-detail-btn').forEach(btn => { const parent = btn.closest('div[data-type]'); const type = parent.dataset.type; const value = btn.dataset.value; let isActive = false; if (type === 'elevation') isActive = (appState.currentPuttElevation === value); else if (type === 'break') isActive = (appState.currentPuttBreak === value); btn.classList.toggle('active', isActive); }); }
+        
+        // --- PRIMARY EXECUTION ---
+        document.addEventListener('DOMContentLoaded', init);
+
+        // --- LARGE DATA OBJECT ---
+        function getLocalStrokesGainedData() {
+            return { "tee": { "100": 2.92, "101": 2.92, "102": 2.93, "103": 2.93, "104": 2.94, "105": 2.94, "106": 2.95, "107": 2.95, "108": 2.96, "109": 2.96, "110": 2.96, "111": 2.97, "112": 2.97, "113": 2.98, "114": 2.98, "115": 2.98, "116": 2.98, "117": 2.99, "118": 2.99, "119": 2.99, "120": 2.99, "121": 2.99, "122": 2.99, "123": 2.99, "124": 2.99, "125": 2.99, "126": 2.99, "127": 2.99, "128": 2.99, "129": 2.99, "130": 2.98, "131": 2.98, "132": 2.98, "133": 2.98, "134": 2.98, "135": 2.98, "136": 2.97, "137": 2.97, "138": 2.97, "139": 2.97, "140": 2.97, "141": 2.97, "142": 2.97, "143": 2.97, "144": 2.97, "145": 2.97, "146": 2.97, "147": 2.97, "148": 2.97, "149": 2.97, "150": 2.97, "151": 2.97, "152": 2.97, "153": 2.98, "154": 2.98, "155": 2.98, "156": 2.98, "157": 2.98, "158": 2.99, "159": 2.99, "160": 2.99, "161": 2.99, "162": 2.99, "163": 3.0, "164": 3.0, "165": 3.0, "166": 3.01, "167": 3.01, "168": 3.01, "169": 3.01, "170": 3.02, "171": 3.02, "172": 3.02, "173": 3.03, "174": 3.03, "175": 3.03, "176": 3.04, "177": 3.04, "178": 3.04, "179": 3.05, "180": 3.05, "181": 3.06, "182": 3.06, "183": 3.06, "184": 3.06, "185": 3.07, "186": 3.07, "187": 3.08, "188": 3.08, "189": 3.08, "190": 3.09, "191": 3.09, "192": 3.09, "193": 3.1, "194": 3.1, "195": 3.1, "196": 3.11, "197": 3.11, "198": 3.11, "199": 3.12, "200": 3.12, "201": 3.12, "202": 3.13, "203": 3.13, "204": 3.13, "205": 3.13, "206": 3.14, "207": 3.14, "208": 3.14, "209": 3.14, "210": 3.15, "211": 3.15, "212": 3.15, "213": 3.15, "214": 3.16, "215": 3.16, "216": 3.16, "217": 3.16, "218": 3.17, "219": 3.17, "220": 3.17, "221": 3.17, "222": 3.17, "223": 3.18, "224": 3.18, "225": 3.18, "226": 3.19, "227": 3.19, "228": 3.19, "229": 3.19, "230": 3.2, "231": 3.2, "232": 3.21, "233": 3.21, "234": 3.22, "235": 3.22, "236": 3.23, "237": 3.23, "238": 3.24, "239": 3.24, "240": 3.25, "241": 3.26, "242": 3.26, "243": 3.27, "244": 3.28, "245": 3.29, "246": 3.3, "247": 3.31, "248": 3.32, "249": 3.33, "250": 3.34, "251": 3.35, "252": 3.36, "253": 3.37, "254": 3.38, "255": 3.39, "256": 3.4, "257": 3.42, "258": 3.43, "259": 3.44, "260": 3.45, "261": 3.46, "262": 3.47, "263": 3.49, "264": 3.5, "265": 3.51, "266": 3.52, "267": 3.53, "268": 3.54, "269": 3.55, "270": 3.56, "271": 3.57, "272": 3.58, "273": 3.59, "274": 3.6, "275": 3.61, "276": 3.62, "277": 3.63, "278": 3.64, "279": 3.64, "280": 3.65, "281": 3.66, "282": 3.66, "283": 3.67, "284": 3.67, "285": 3.67, "286": 3.68, "287": 3.68, "288": 3.68, "289": 3.69, "290": 3.69, "291": 3.69, "292": 3.69, "293": 3.69, "294": 3.7, "295": 3.7, "296": 3.7, "297": 3.7, "298": 3.71, "299": 3.71, "300": 3.71, "301": 3.71, "302": 3.72, "303": 3.72, "304": 3.72, "305": 3.73, "306": 3.73, "307": 3.73, "308": 3.74, "309": 3.74, "310": 3.75, "311": 3.75, "312": 3.76, "313": 3.76, "314": 3.76, "315": 3.77, "316": 3.77, "317": 3.78, "318": 3.78, "319": 3.79, "320": 3.79, "321": 3.79, "322": 3.8, "323": 3.8, "324": 3.81, "325": 3.81, "326": 3.81, "327": 3.82, "328": 3.82, "329": 3.82, "330": 3.83, "331": 3.83, "332": 3.83, "333": 3.84, "334": 3.84, "335": 3.84, "336": 3.85, "337": 3.85, "338": 3.85, "339": 3.86, "340": 3.86, "341": 3.86, "342": 3.87, "343": 3.87, "344": 3.87, "345": 3.88, "346": 3.88, "347": 3.88, "348": 3.89, "349": 3.89, "350": 3.89, "351": 3.89, "352": 3.9, "353": 3.9, "354": 3.9, "355": 3.91, "356": 3.91, "357": 3.91, "358": 3.91, "359": 3.92, "360": 3.92, "361": 3.92, "362": 3.92, "363": 3.93, "364": 3.93, "365": 3.93, "366": 3.93, "367": 3.94, "368": 3.94, "369": 3.94, "370": 3.94, "371": 3.94, "372": 3.95, "373": 3.95, "374": 3.95, "375": 3.95, "376": 3.95, "377": 3.95, "378": 3.96, "379": 3.96, "380": 3.96, "381": 3.96, "382": 3.96, "383": 3.96, "384": 3.97, "385": 3.97, "386": 3.97, "387": 3.97, "388": 3.97, "389": 3.97, "390": 3.98, "391": 3.98, "392": 3.98, "393": 3.98, "394": 3.98, "395": 3.98, "396": 3.98, "397": 3.99, "398": 3.99, "399": 3.99, "400": 3.99, "401": 3.99, "402": 3.99, "403": 3.99, "404": 4.0, "405": 4.0, "406": 4.0, "407": 4.0, "408": 4.0, "409": 4.0, "410": 4.0, "411": 4.0, "412": 4.01, "413": 4.01, "414": 4.01, "415": 4.01, "416": 4.01, "417": 4.01, "418": 4.02, "419": 4.02, "420": 4.02, "421": 4.02, "422": 4.02, "423": 4.03, "424": 4.03, "425": 4.03, "426": 4.03, "427": 4.04, "428": 4.04, "429": 4.04, "430": 4.05, "431": 4.05, "432": 4.05, "433": 4.05, "434": 4.06, "435": 4.06, "436": 4.07, "437": 4.07, "438": 4.07, "439": 4.08, "440": 4.08, "441": 4.08, "442": 4.09, "443": 4.09, "444": 4.1, "445": 4.1, "446": 4.1, "447": 4.11, "448": 4.11, "449": 4.12, "450": 4.12, "451": 4.13, "452": 4.13, "453": 4.14, "454": 4.14, "455": 4.15, "456": 4.15, "457": 4.15, "458": 4.16, "459": 4.16, "460": 4.17, "461": 4.17, "462": 4.18, "463": 4.19, "464": 4.19, "465": 4.2, "466": 4.2, "467": 4.21, "468": 4.21, "469": 4.22, "470": 4.22, "471": 4.23, "472": 4.23, "473": 4.24, "474": 4.24, "475": 4.25, "476": 4.26, "477": 4.26, "478": 4.27, "479": 4.27, "480": 4.28, "481": 4.29, "482": 4.29, "483": 4.3, "484": 4.3, "485": 4.31, "486": 4.32, "487": 4.32, "488": 4.33, "489": 4.34, "490": 4.34, "491": 4.35, "492": 4.36, "493": 4.36, "494": 4.37, "495": 4.38, "496": 4.38, "497": 4.39, "498": 4.4, "499": 4.4, "500": 4.41, "501": 4.42, "502": 4.42, "503": 4.43, "504": 4.44, "505": 4.44, "506": 4.45, "507": 4.46, "508": 4.46, "509": 4.47, "510": 4.48, "511": 4.48, "512": 4.49, "513": 4.5, "514": 4.5, "515": 4.51, "516": 4.52, "517": 4.52, "518": 4.53, "519": 4.53, "520": 4.54, "521": 4.55, "522": 4.55, "523": 4.56, "524": 4.56, "525": 4.57, "526": 4.58, "527": 4.58, "528": 4.59, "529": 4.59, "530": 4.6, "531": 4.6, "532": 4.61, "533": 4.61, "534": 4.62, "535": 4.62, "536": 4.63, "537": 4.63, "538": 4.64, "539": 4.64, "540": 4.65, "541": 4.66, "542": 4.66, "543": 4.67, "544": 4.67, "545": 4.67, "546": 4.68, "547": 4.68, "548": 4.69, "549": 4.69, "550": 4.7, "551": 4.7, "552": 4.71, "553": 4.71, "554": 4.72, "555": 4.72, "556": 4.72, "557": 4.73, "558": 4.73, "559": 4.74, "560": 4.74, "561": 4.74, "562": 4.75, "563": 4.75, "564": 4.75, "565": 4.76, "566": 4.76, "567": 4.76, "568": 4.76, "569": 4.77, "570": 4.77, "571": 4.77, "572": 4.77, "573": 4.78, "574": 4.78, "575": 4.78, "576": 4.78, "577": 4.78, "578": 4.79, "579": 4.79, "580": 4.79, "581": 4.79, "582": 4.79, "583": 4.8, "584": 4.8, "585": 4.8, "586": 4.8, "587": 4.8, "588": 4.8, "589": 4.8, "590": 4.81, "591": 4.81, "592": 4.81, "593": 4.81, "594": 4.81, "595": 4.81, "596": 4.81, "597": 4.82, "598": 4.82, "599": 4.82, "600": 4.82 }, "rough": { "3": 2.16, "4": 2.19, "5": 2.21, "6": 2.24, "7": 2.26, "8": 2.29, "9": 2.31, "10": 2.34, "11": 2.37, "12": 2.4, "13": 2.42, "14": 2.45, "15": 2.48, "16": 2.5, "17": 2.53, "18": 2.55, "19": 2.57, "20": 2.59, "21": 2.61, "22": 2.62, "23": 2.63, "24": 2.64, "25": 2.65, "26": 2.66, "27": 2.67, "28": 2.68, "29": 2.69, "30": 2.7, "31": 2.71, "32": 2.71, "33": 2.72, "34": 2.73, "35": 2.74, "36": 2.75, "37": 2.75, "38": 2.76, "39": 2.77, "40": 2.78, "41": 2.79, "42": 2.8, "43": 2.81, "44": 2.82, "45": 2.83, "46": 2.84, "47": 2.85, "48": 2.85, "49": 2.86, "50": 2.87, "51": 2.87, "52": 2.88, "53": 2.88, "54": 2.88, "55": 2.89, "56": 2.89, "57": 2.89, "58": 2.9, "59": 2.9, "60": 2.91, "61": 2.91, "62": 2.91, "63": 2.92, "64": 2.92, "65": 2.92, "66": 2.92, "67": 2.92, "68": 2.93, "69": 2.93, "70": 2.93, "71": 2.93, "72": 2.94, "73": 2.94, "74": 2.94, "75": 2.94, "76": 2.95, "77": 2.95, "78": 2.95, "79": 2.96, "80": 2.96, "81": 2.96, "82": 2.97, "83": 2.97, "84": 2.97, "85": 2.98, "86": 2.98, "87": 2.98, "88": 2.99, "89": 2.99, "90": 2.99, "91": 2.99, "92": 3.0, "93": 3.0, "94": 3.0, "95": 3.01, "96": 3.01, "97": 3.01, "98": 3.01, "99": 3.02, "100": 3.02, "101": 3.02, "102": 3.03, "103": 3.03, "104": 3.03, "105": 3.03, "106": 3.04, "107": 3.04, "108": 3.04, "109": 3.05, "110": 3.05, "111": 3.05, "112": 3.06, "113": 3.06, "114": 3.06, "115": 3.06, "116": 3.07, "117": 3.07, "118": 3.07, "119": 3.08, "120": 3.08, "121": 3.08, "122": 3.09, "123": 3.09, "124": 3.09, "125": 3.1, "126": 3.1, "127": 3.1, "128": 3.11, "129": 3.11, "130": 3.11, "131": 3.12, "132": 3.12, "133": 3.12, "134": 3.13, "135": 3.13, "136": 3.13, "137": 3.14, "138": 3.14, "139": 3.14, "140": 3.15, "141": 3.15, "142": 3.16, "143": 3.16, "144": 3.17, "145": 3.17, "146": 3.17, "147": 3.18, "148": 3.18, "149": 3.19, "150": 3.19, "151": 3.19, "152": 3.2, "153": 3.2, "154": 3.21, "155": 3.21, "156": 3.21, "157": 3.22, "158": 3.22, "159": 3.23, "160": 3.23, "161": 3.23, "162": 3.24, "163": 3.24, "164": 3.25, "165": 3.25, "166": 3.26, "167": 3.26, "168": 3.26, "169": 3.26, "170": 3.27, "171": 3.27, "172": 3.28, "173": 3.28, "174": 3.28, "175": 3.29, "176": 3.29, "177": 3.3, "178": 3.3, "179": 3.31, "180": 3.31, "181": 3.31, "182": 3.32, "183": 3.32, "184": 3.33, "185": 3.34, "186": 3.34, "187": 3.35, "188": 3.35, "189": 3.36, "190": 3.36, "191": 3.37, "192": 3.37, "193": 3.38, "194": 3.39, "195": 3.39, "196": 3.4, "197": 3.4, "198": 3.41, "199": 3.41, "200": 3.42, "201": 3.42, "202": 3.43, "203": 3.43, "204": 3.44, "205": 3.45, "206": 3.45, "207": 3.46, "208": 3.46, "209": 3.47, "210": 3.48, "211": 3.48, "212": 3.49, "213": 3.49, "214": 3.5, "215": 3.5, "216": 3.51, "217": 3.51, "218": 3.52, "219": 3.52, "220": 3.53, "221": 3.53, "222": 3.54, "223": 3.55, "224": 3.55, "225": 3.56, "226": 3.56, "227": 3.57, "228": 3.57, "229": 3.58, "230": 3.59, "231": 3.59, "232": 3.6, "233": 3.6, "234": 3.61, "235": 3.61, "236": 3.62, "237": 3.62, "238": 3.63, "239": 3.63, "240": 3.64, "241": 3.64, "242": 3.65, "243": 3.65, "244": 3.66, "245": 3.66, "246": 3.67, "247": 3.67, "248": 3.68, "249": 3.68, "250": 3.69, "251": 3.69, "252": 3.7, "253": 3.7, "254": 3.71, "255": 3.71, "256": 3.72, "257": 3.72, "258": 3.73, "259": 3.73, "260": 3.74, "261": 3.74, "262": 3.75, "263": 3.75, "264": 3.76, "265": 3.76, "266": 3.77, "267": 3.77, "268": 3.78, "269": 3.78, "270": 3.79, "271": 3.79, "272": 3.79, "273": 3.8, "274": 3.8, "275": 3.81, "276": 3.81, "277": 3.82, "278": 3.82, "279": 3.83, "280": 3.83, "281": 3.83, "282": 3.84, "283": 3.84, "284": 3.85, "285": 3.85, "286": 3.85, "287": 3.86, "288": 3.86, "289": 3.86, "290": 3.87, "291": 3.88, "292": 3.88, "293": 3.88, "294": 3.88, "295": 3.89, "296": 3.89, "297": 3.89, "298": 3.89, "299": 3.9, "300": 3.9, "301": 3.9, "302": 3.91, "303": 3.91, "304": 3.91, "305": 3.91, "306": 3.92, "307": 3.92, "308": 3.92, "309": 3.92, "310": 3.92, "311": 3.93, "312": 3.93, "313": 3.93, "314": 3.93, "315": 3.94, "316": 3.94, "317": 3.94, "318": 3.94, "319": 3.95, "320": 3.95, "321": 3.95, "322": 3.96, "323": 3.96, "324": 3.96, "325": 3.96, "326": 3.97, "327": 3.97, "328": 3.97, "329": 3.98, "330": 3.98, "331": 3.99, "332": 3.99, "333": 3.99, "334": 4.0, "335": 4.0, "336": 4.0, "337": 4.01, "338": 4.01, "339": 4.02, "340": 4.02, "341": 4.02, "342": 4.03, "343": 4.03, "344": 4.04, "345": 4.04, "346": 4.05, "347": 4.05, "348": 4.05, "349": 4.06, "350": 4.06, "351": 4.07, "352": 4.07, "353": 4.08, "559": 5.05, "560": 5.05, "561": 5.06, "562": 5.06, "563": 5.06, "564": 5.06, "565": 5.07, "566": 5.07, "567": 5.07, "568": 5.07, "569": 5.08, "570": 5.08, "571": 5.08, "572": 5.08, "573": 5.09, "574": 5.09, "575": 5.09, "576": 5.09, "577": 5.09, "578": 5.1, "579": 5.1, "580": 5.1, "581": 5.1, "582": 5.11, "583": 5.11, "584": 5.11, "585": 5.11, "586": 5.11, "587": 5.11, "588": 5.11, "589": 5.12, "590": 5.12, "591": 5.12, "592": 5.12, "593": 5.12, "594": 5.12, "595": 5.12, "596": 5.12, "597": 5.13, "598": 5.13, "599": 5.13, "600": 5.13 }, "sand": { "3": 2.25, "4": 2.28, "5": 2.3, "6": 2.32, "7": 2.35, "8": 2.37, "9": 2.4, "10": 2.43, "11": 2.44, "12": 2.45, "13": 2.46, "14": 2.47, "15": 2.48, "16": 2.49, "17": 2.5, "18": 2.51, "19": 2.52, "20": 2.53, "21": 2.54, "22": 2.55, "23": 2.56, "24": 2.58, "25": 2.59, "26": 2.6, "27": 2.61, "28": 2.63, "29": 2.64, "30": 2.66, "31": 2.67, "32": 2.69, "33": 2.71, "34": 2.73, "35": 2.75, "36": 2.76, "37": 2.8, "38": 2.8, "39": 2.81, "40": 2.82, "41": 2.83, "42": 2.84, "43": 2.85, "44": 2.86, "45": 2.87, "46": 2.88, "47": 2.89, "48": 2.9, "49": 2.91, "50": 2.92, "51": 2.94, "52": 2.96, "53": 2.99, "54": 3.01, "55": 3.04, "56": 3.06, "57": 3.09, "58": 3.11, "59": 3.13, "60": 3.15, "61": 3.17, "62": 3.18, "63": 3.19, "64": 3.19, "65": 3.2, "66": 3.2, "67": 3.2, "68": 3.21, "69": 3.21, "70": 3.21, "71": 3.21, "72": 3.22, "73": 3.22, "74": 3.22, "75": 3.23, "76": 3.23, "77": 3.23, "78": 3.23, "79": 3.24, "80": 3.24, "81": 3.24, "82": 3.24, "83": 3.24, "84": 3.24, "85": 3.24, "86": 3.24, "87": 3.24, "88": 3.24, "89": 3.24, "90": 3.24, "91": 3.24, "92": 3.24, "93": 3.24, "94": 3.24, "95": 3.24, "96": 3.24, "97": 3.23, "98": 3.23, "99": 3.23, "100": 3.23, "101": 3.23, "102": 3.23, "103": 3.23, "104": 3.23, "105": 3.22, "106": 3.22, "107": 3.22, "108": 3.22, "109": 3.22, "110": 3.22, "111": 3.22, "112": 3.22, "113": 3.22, "114": 3.21, "115": 3.21, "116": 3.21, "117": 3.21, "118": 3.21, "119": 3.21, "120": 3.21, "121": 3.21, "122": 3.21, "123": 3.21, "124": 3.21, "125": 3.21, "126": 3.21, "127": 3.21, "128": 3.21, "129": 3.21, "130": 3.21, "131": 3.21, "132": 3.21, "133": 3.21, "134": 3.21, "135": 3.21, "136": 3.21, "137": 3.22, "138": 3.22, "139": 3.22, "140": 3.22, "141": 3.22, "142": 3.22, "143": 3.23, "144": 3.23, "145": 3.23, "146": 3.23, "147": 3.23, "148": 3.24, "149": 3.24, "150": 3.24, "151": 3.25, "152": 3.25, "153": 3.25, "154": 3.26, "155": 3.26, "156": 3.27, "157": 3.27, "158": 3.27, "159": 3.28, "160": 3.28, "161": 3.28, "162": 3.29, "163": 3.29, "164": 3.3, "165": 3.3, "166": 3.31, "167": 3.32, "168": 3.32, "169": 3.33, "170": 3.33, "171": 3.34, "172": 3.35, "173": 3.35, "174": 3.36, "175": 3.37, "176": 3.37, "177": 3.38, "178": 3.39, "179": 3.39, "180": 3.4, "181": 3.41, "182": 3.42, "183": 3.42, "184": 3.43, "185": 3.44, "186": 3.44, "187": 3.45, "188": 3.46, "189": 3.46, "190": 3.47, "191": 3.48, "192": 3.49, "193": 3.5, "194": 3.5, "195": 3.51, "196": 3.52, "197": 3.53, "198": 3.53, "199": 3.54, "200": 3.55, "201": 3.56, "202": 3.57, "203": 3.57, "204": 3.58, "205": 3.59, "206": 3.6, "207": 3.6, "208": 3.61, "209": 3.62, "210": 3.63, "211": 3.63, "212": 3.64, "213": 3.65, "214": 3.66, "215": 3.66, "216": 3.67, "217": 3.68, "218": 3.69, "219": 3.69, "220": 3.7, "221": 3.71, "222": 3.72, "223": 3.72, "224": 3.73, "225": 3.74, "226": 3.74, "227": 3.75, "228": 3.76, "229": 3.77, "230": 3.77, "231": 3.78, "232": 3.79, "233": 3.8, "234": 3.8, "235": 3.81, "236": 3.82, "237": 3.82, "238": 3.83, "239": 3.83, "240": 3.84, "241": 3.85, "242": 3.85, "243": 3.86, "244": 3.86, "245": 3.87, "246": 3.87, "247": 3.88, "248": 3.88, "249": 3.89, "250": 3.89, "251": 3.89, "252": 3.9, "253": 3.9, "254": 3.91, "255": 3.91, "256": 3.91, "257": 3.92, "258": 3.92, "259": 3.93, "260": 3.93, "261": 3.93, "262": 3.94, "263": 3.94, "264": 3.95, "265": 3.95, "266": 3.95, "267": 3.96, "268": 3.96, "269": 3.96, "270": 3.97, "271": 3.97, "272": 3.98, "273": 3.98, "274": 3.98, "275": 3.99, "276": 3.99, "277": 3.99, "278": 3.99, "279": 4.0, "280": 4.0, "281": 4.0, "282": 4.01, "283": 4.01, "284": 4.01, "285": 4.01, "286": 4.01, "287": 4.01, "288": 4.02, "289": 4.02, "290": 4.02, "291": 4.02, "292": 4.02, "293": 4.03, "294": 4.03, "295": 4.03, "296": 4.03, "297": 4.03, "298": 4.04, "299": 4.04, "300": 4.04, "301": 4.04, "302": 4.05, "303": 4.05, "304": 4.05, "305": 4.05, "306": 4.06, "307": 4.06, "308": 4.06, "309": 4.07, "310": 4.07, "311": 4.08, "312": 4.08, "313": 4.08, "314": 4.09, "315": 4.09, "316": 4.1, "317": 4.1, "318": 4.11, "319": 4.11, "320": 4.12, "321": 4.13, "322": 4.13, "323": 4.14, "324": 4.14, "325": 4.15, "326": 4.16, "327": 4.16, "328": 4.17, "329": 4.18, "330": 4.19, "331": 4.19, "332": 4.2, "333": 4.21, "334": 4.21, "335": 4.22, "336": 4.23, "337": 4.24, "338": 4.24, "339": 4.25, "340": 4.26, "341": 4.27, "342": 4.28, "343": 4.28, "344": 4.29, "345": 4.3, "346": 4.31, "347": 4.31, "348": 4.32, "349": 4.33, "350": 4.34, "351": 4.34, "352": 4.35, "353": 4.36, "354": 4.37, "355": 4.37, "356": 4.38, "357": 4.39, "358": 4.4, "359": 4.4, "360": 4.41, "361": 4.42, "362": 4.42, "363": 4.43, "364": 4.44, "365": 4.44, "366": 4.45, "367": 4.46, "368": 4.47, "369": 4.47, "370": 4.48, "371": 4.49, "372": 4.49, "373": 4.5, "374": 4.51, "375": 4.51, "376": 4.52, "377": 4.53, "378": 4.53, "379": 4.54, "380": 4.55, "381": 4.56, "382": 4.57, "383": 4.57, "384": 4.58, "385": 4.59, "386": 4.6, "387": 4.6, "388": 4.61, "389": 4.62, "390": 4.63, "391": 4.64, "392": 4.64, "393": 4.65, "394": 4.66, "395": 4.66, "396": 4.67, "397": 4.67, "398": 4.68, "399": 4.69, "400": 4.69, "401": 4.69, "402": 4.7, "403": 4.7, "404": 4.7, "405": 4.71, "406": 4.71, "407": 4.71, "408": 4.71, "409": 4.72, "410": 4.72, "411": 4.72, "412": 4.72, "413": 4.72, "414": 4.72, "415": 4.72, "416": 4.73, "417": 4.73, "418": 4.73, "419": 4.73, "420": 4.73, "421": 4.73, "422": 4.73, "423": 4.73, "424": 4.74, "425": 4.74, "426": 4.74, "427": 4.74, "428": 4.74, "429": 4.75, "430": 4.75, "431": 4.75, "432": 4.75, "433": 4.76, "434": 4.76, "435": 4.76, "436": 4.77, "437": 4.77, "438": 4.77, "439": 4.78, "440": 4.78, "441": 4.78, "442": 4.79, "443": 4.79, "444": 4.8, "445": 4.8, "446": 4.8, "447": 4.81, "448": 4.81, "449": 4.82, "450": 4.82, "451": 4.83, "452": 4.83, "453": 4.84, "454": 4.84, "455": 4.85, "456": 4.85, "457": 4.86, "458": 4.86, "459": 4.87, "460": 4.87, "461": 4.88, "462": 4.88, "463": 4.89, "464": 4.89, "465": 4.89, "466": 4.9, "467": 4.91, "468": 4.91, "469": 4.92, "470": 4.92, "471": 4.93, "472": 4.93, "473": 4.94, "474": 4.94, "475": 4.95, "476": 4.96, "477": 4.96, "478": 4.97, "479": 4.97, "480": 4.98, "481": 4.99, "482": 4.99, "483": 5.0, "484": 5.0, "485": 5.01, "486": 5.02, "487": 5.02, "488": 5.03, "489": 5.04, "490": 5.04, "491": 5.05, "492": 5.06, "493": 5.06, "494": 5.07, "495": 5.08, "496": 5.08, "497": 5.09, "498": 5.1, "499": 5.1, "500": 5.11, "501": 5.12, "502": 5.13, "503": 5.13, "504": 5.14, "505": 5.14, "506": 5.15, "507": 5.16, "508": 5.16, "509": 5.17, "510": 5.18, "511": 5.18, "512": 5.19, "513": 5.19, "514": 5.2, "515": 5.21, "516": 5.22, "517": 5.22, "518": 5.23, "519": 5.23, "520": 5.24, "521": 5.25, "522": 5.26, "523": 5.26, "524": 5.27, "525": 5.27, "526": 5.28, "527": 5.28, "528": 5.29, "529": 5.3, "530": 5.3, "531": 5.31, "532": 5.32, "533": 5.32, "534": 5.33, "535": 5.33, "536": 5.34, "537": 5.34, "538": 5.35, "539": 5.35, "540": 5.36, "541": 5.36, "542": 5.37, "543": 5.37, "544": 5.38, "545": 5.38, "546": 5.39, "547": 5.39, "548": 5.4, "549": 5.4, "550": 5.4, "551": 5.41, "552": 5.41, "553": 5.42, "554": 5.42, "555": 5.42, "556": 5.43, "557": 5.43, "558": 5.43, "559": 5.44, "600": 5.52 }, "putting": { "1": 1.0, "2": 1.01, "3": 1.04, "4": 1.13, "5": 1.23, "6": 1.34, "7": 1.42, "8": 1.5, "9": 1.56, "10": 1.61, "11": 1.65, "12": 1.69, "13": 1.73, "14": 1.75, "15": 1.78, "16": 1.8, "17": 1.82, "18": 1.84, "19": 1.86, "20": 1.87, "21": 1.88, "22": 1.9, "23": 1.91, "24": 1.92, "25": 1.93, "26": 1.94, "27": 1.95, "28": 1.96, "29": 1.97, "30": 1.98, "31": 1.99, "32": 1.99, "33": 2.0, "34": 2.01, "35": 2.02, "36": 2.03, "37": 2.03, "38": 2.04, "39": 2.05, "40": 2.06, "41": 2.07, "42": 2.08, "43": 2.09, "44": 2.09, "45": 2.1, "46": 2.11, "47": 2.12, "48": 2.13, "49": 2.13, "50": 2.14, "51": 2.15, "52": 2.15, "53": 2.16, "54": 2.17, "55": 2.18, "56": 2.18, "57": 2.19, "58": 2.2, "59": 2.2, "60": 2.21, "61": 2.22, "62": 2.22, "63": 2.23, "64": 2.24, "65": 2.24, "66": 2.25, "67": 2.26, "68": 2.26, "69": 2.27, "70": 2.28, "71": 2.28, "72": 2.29, "73": 2.29, "74": 2.3, "75": 2.31, "76": 2.31, "77": 2.32, "78": 2.33, "79": 2.33, "80": 2.34, "81": 2.34, "82": 2.35, "83": 2.36, "84": 2.36, "85": 2.37, "86": 2.38, "87": 2.38, "88": 2.39, "89": 2.39, "90": 2.4 } };
+        }
+    </script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f1f5f9; }
+        .card { background-color: white; border-radius: 0.75rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.05); padding: 1.5rem; border: 1px solid #e2e8f0; }
+        .form-section-title { font-size: 1.25rem; font-weight: 700; color: #1e293b; margin-bottom: 1.25rem; padding-bottom: 0.75rem; border-bottom: 1px solid #e2e8f0; }
+        label { display: block; margin-bottom: 0.375rem; font-weight: 500; color: #475569; font-size: 0.875rem; }
+        input[type="text"], input[type="number"], input[type="date"], select { width: 100%; padding: 0.625rem 0.875rem; border: 1px solid #cbd5e1; border-radius: 0.5rem; box-shadow: inset 0 1px 2px 0 rgb(0 0 0 / 0.05); font-size: 0.875rem; color: #334155; background-color: #f8fafc; transition: border-color 0.2s, box-shadow 0.2s; }
+        input:focus, select:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.25); }
+        .btn { display: inline-flex; align-items: center; justify-content: center; font-weight: 600; border-radius: 0.5rem; padding: 0.75rem 1.5rem; font-size: 0.875rem; line-height: 1.25rem; transition: all 0.2s ease-in-out; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.1), 0 1px 2px 0 rgba(0,0,0,0.06); border: 1px solid transparent; cursor: pointer; }
+        .btn-primary { background-color: #2563eb; color: white; } .btn-primary:hover { background-color: #1d4ed8; }
+        .btn-green { background-color: #059669; color: white; } .btn-green:hover { background-color: #047857; }
+        .btn-red { background-color: #dc2626; color: white; } .btn-red:hover { background-color: #b91c1c; }
+        .btn-indigo { background-color: #4f46e5; color: white; } .btn-indigo:hover { background-color: #4338ca; }
+        .btn-muted { background-color: #f1f5f9; color: #475569; border-color: #cbd5e1; } .btn-muted:hover { background-color: #e2e8f0; }
+        #loadingIndicator, #resumeSessionModal, #gamificationModal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; z-index: 9999; }
+        #loadingIndicator.hidden, #resumeSessionModal.hidden, #gamificationModal.hidden { display: none !important; }
+        .modal-backdrop { position: fixed; inset: 0; background-color: rgba(15, 23, 42, 0.6); backdrop-filter: blur(2px); }
+        .spinner { border: 5px solid rgba(0,0,0,0.1); width: 50px; height: 50px; border-radius: 50%; border-left-color: #2563eb; animation: spin 1s ease infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        #messageModal { position: fixed; top: 1.5rem; left: 50%; transform: translateX(-50%) translateY(-150%); z-index: 10000; opacity: 0; visibility: hidden; transition: opacity 0.3s ease, visibility 0.3s ease, transform 0.3s ease; }
+        #messageModal.visible { opacity: 1; visibility: visible; transform: translateX(-50%) translateY(0); }
+        .table-responsive-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid #e2e8f0; border-radius: 0.5rem; }
+        table th { background-color: #f8fafc; color: #475569; font-weight: 600; text-align: left; }
+        table th, table td { white-space: nowrap; padding: 0.75rem 1rem; text-align: left; }
+        .stat-card { background-color: #ffffff; padding: 1rem; border-radius: 0.75rem; border: 1px solid #e2e8f0; box-shadow: 0 1px 2px 0 rgba(0,0,0,0.05); display: flex; flex-direction: column; justify-content: center;}
+        .stat-card-label { display: block; font-size: 0.875rem; font-weight: 500; color: #64748b; margin-bottom: 0.25rem; }
+        .stat-card-value { display: block; font-size: 1.75rem; font-weight: 700; }
+        nav button.active { background-color: white; color: #2563eb; font-weight: 600; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.1), 0 1px 2px -1px rgba(0,0,0,0.1); }
+        .putt-detail-btn { padding: 0.5rem 1rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; background-color: white; font-weight: 500; font-size: 0.875rem; cursor: pointer; transition: all 0.2s; }
+        .putt-detail-btn:hover { background-color: #f1f5f9; }
+        .putt-detail-btn.active { background-color: #4f46e5; color: white; border-color: #4f46e5; }
+        #celebrationBanner { position: fixed; top: 1rem; left: 50%; transform: translateX(-50%) translateY(-150%); transition: transform 0.5s ease-in-out; z-index: 10001; }
+        #celebrationBanner.show { transform: translateX(-50%) translateY(0); }
+    </style>
+<script>
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/sw.js')
+                .then(registration => console.log('Service Worker registered!'))
+                .catch(err => console.log('Service Worker registration failed: ', err));
+        });
+    }
+</script>
+</head>
+<body class="bg-slate-100 min-h-screen antialiased text-slate-800">
+    <div id="loadingIndicator" class="hidden"><div class="modal-backdrop"></div><div class="spinner"></div></div>
+    <div id="messageModal" class="opacity-0 invisible fixed p-4 rounded-lg shadow-lg border"><p id="messageText" class="text-sm font-medium"></p><button id="closeMessageModalButton" class="sr-only">Close</button></div>
+    <div id="resumeSessionModal" class="hidden"><div class="modal-backdrop"></div><div class="relative p-4 w-full max-w-sm m-auto"><div class="bg-white rounded-lg shadow-xl p-6 text-center"><h3 class="text-lg font-semibold text-slate-800">In-Progress Round Found</h3><p class="text-sm text-slate-500 mt-2 mb-6">You have an unfinished round saved. Would you like to resume where you left off, or discard it?</p><div class="flex justify-center space-x-4"><button id="discardSessionButton" class="btn btn-muted">Discard & Start New</button><button id="resumeSessionButton" class="btn btn-primary">Resume Session</button></div></div></div></div>
+    
+    <div id="celebrationBanner" class="p-4 rounded-lg shadow-lg text-white font-bold text-lg"></div>
+    <div id="gamificationModal" class="hidden"><div class="modal-backdrop"></div><div class="relative bg-white rounded-lg shadow-xl p-8 w-full max-w-md text-center m-auto"><div id="gamificationModalIcon" class="mx-auto mb-4 w-16 h-16 text-5xl flex items-center justify-center"></div><h3 id="gamificationModalTitle" class="text-2xl font-bold text-slate-800"></h3><p id="gamificationModalText" class="text-slate-500 mt-2 mb-6"></p><button id="closeGamificationModalButton" class="btn btn-primary">Keep Going!</button></div></div>
+
+    <div class="container mx-auto max-w-7xl py-8 px-4">
+        <header class="mb-8 text-center">
+            <h1 id="appTitle" class="text-3xl md:text-4xl font-bold text-slate-800">Play the Percentage Golf</h1>
+            <p class="text-lg text-slate-500">Advanced Strokes Gained & Stats Tracker</p>
+            <p id="userIdDisplay" class="text-xs text-slate-400 mt-3">User ID: Loading...</p>
+        </header>
+
+        <nav class="mb-8 flex justify-center"><div class="inline-flex rounded-lg bg-slate-200 p-1 space-x-1"><button id="navLinkDashboard" class="px-5 py-2 text-sm text-slate-600 rounded-md transition-colors active">Dashboard</button><button id="navLinkDataEntry" class="px-5 py-2 text-sm text-slate-600 rounded-md transition-colors">Data Entry</button></div></nav>
+
+        <main>
+            <div id="pageDashboard">
+                <section id="achievementsSection" class="card mb-8">
+                    <h2 class="form-section-title">Achievements</h2>
+                    <div id="achievementsContainer" class="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 gap-4"></div>
+                </section>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    <section class="card">
+                        <h2 class="form-section-title !mb-6 !pb-2 !border-b">Strokes Gained Profile</h2>
+                        <div id="sgProfileSvgContainer" class="h-96 w-full flex items-center justify-center"></div>
+                    </section>
+                    <section class="card flex items-center justify-center">
+                        <div class="h-96 w-full"><canvas id="approachYardageChart"></canvas></div>
+                    </section>
+                    <section class="card flex items-center justify-center">
+                        <div class="h-96 w-full"><canvas id="sgBreakdownChart"></canvas></div>
+                    </section>
+                    <section class="card flex items-center justify-center">
+                        <div class="h-80 w-full"><canvas id="performanceTrendChart"></canvas></div>
+                    </section>
+                    <section class="card flex items-center justify-center lg:col-span-2">
+                        <div class="h-80 w-full"><canvas id="tiger5Chart"></canvas></div>
+                    </section>
+                </div>
+
+                 <section class="card mt-8">
+                    <h2 class="form-section-title">Performance Summary (18-Hole Normalized)</h2>
+                    <div id="statsSummary"><p class="text-center text-slate-500 py-4">Loading summary...</p></div>
+                    <h3 class="form-section-title mt-10">Putting Breakdown <span class="text-sm font-normal text-slate-500">(Avg SG per Putt)</span></h3>
+                    <div id="puttingStatsSummary"><p class="text-center text-slate-500 py-4">Loading putting analysis...</p></div>
+                    <h3 class="form-section-title mt-10">"Tiger 5" Averages <span class="text-sm font-normal text-slate-500">(Mistakes per 18 Holes)</span></h3>
+                    <div id="tiger5Summary"><p class="text-center text-slate-500 py-4">Loading mistake analysis...</p></div>
+                </section>
+
+                <section class="card mt-8">
+                    <div class="flex justify-between items-center mb-6"><h2 class="form-section-title !mb-0 !pb-0 !border-none">Recorded Rounds</h2><button id="recalculateRoundsButton" class="btn btn-muted text-xs">Recalculate All Rounds</button></div>
+                    <div class="table-responsive-wrapper"><table class="min-w-full divide-y divide-slate-200 text-sm"><thead class="bg-slate-50"><tr><th class="px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Date</th><th class="px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider">Course</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">Score</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">SG Total</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">SG:OTT</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">SG:APP</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">SG:ARG</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">SG:PUTT</th><th class="px-2 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider" title="Double Bogeys or Worse">Dbl+</th><th class="px-2 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider" title="Bogeys on Par 5s">Bog P5</th><th class="px-2 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider" title="Bogeys from <130yds Approach">Bog &lt;130</th><th class="px-2 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider" title="2+ Chips to Green">2+Chp</th><th class="px-2 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider" title="3+ Putts">3+Putt</th><th class="px-2 py-3 text-center text-xs font-semibold text-red-700 bg-red-50 uppercase tracking-wider">T5 Total</th><th class="px-4 py-3 text-center text-xs font-semibold text-slate-600 uppercase tracking-wider">Actions</th></tr></thead><tbody id="roundsTableBody" class="bg-white divide-y divide-slate-200"></tbody></table></div>
+                </section>
+            </div>
+
+            <div id="pageDataEntry" class="hidden">
+                <div id="workflowContainer" class="max-w-3xl mx-auto">
+                    <form id="initialRoundSetupForm" class="card"><h2 class="form-section-title">1. Start New Round</h2><div class="grid grid-cols-1 md:grid-cols-3 gap-x-6 gap-y-4"><div><label for="roundCourseName">Course Name:</label><input type="text" id="roundCourseName" name="roundCourseName" required placeholder="e.g., Pebble Beach" list="course-list"><datalist id="course-list"></datalist></div><div><label for="roundDate">Date:</label><input type="date" id="roundDate" name="roundDate" required></div><div><label for="roundTotalHoles">Holes to Play:</label><select id="roundTotalHoles" name="roundTotalHoles"><option value="18">18 Holes</option><option value="9">9 Holes</option></select></div></div><button type="submit" class="btn btn-primary w-full mt-8">Continue to Hole Setup</button></form>
+                    <section id="holeSetupSection" class="card hidden"><h2 class="form-section-title">2. Hole <span id="currentHoleNumberDisplay" class="text-blue-600">1</span> Setup</h2><form id="holeInfoForm"><input type="hidden" id="holeNumberInput" name="holeNumberInput"><div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6"><div><label for="holeParInput">Par:</label><input type="number" id="holeParInput" name="holeParInput" min="3" max="5" required placeholder="3, 4, or 5"></div><div><label for="holeLengthInput">Hole Length (yds):</label><input type="number" id="holeLengthInput" name="holeLengthInput" min="50" max="800" required placeholder="e.g., 420"></div></div><button type="submit" class="btn btn-green w-full">Start Shots for Hole <span id="currentHoleNumberDisplayForButton">1</span></button></form></section>
+                    <section id="shotEntrySection" class="card hidden"><h2 class="form-section-title">3. Hole <span id="currentHoleNumberDisplayClone" class="text-blue-600"></span> - Shot <span id="currentShotNumberDisplay" class="text-blue-600">1</span></h2><div class="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-md text-sm"><p><strong>Starting from:</strong> <span id="currentShotStartLieDisplay" class="font-semibold text-blue-700">TEE</span> at <span id="currentShotStartDistanceDisplay" class="font-semibold text-blue-700">0 yds</span></p></div>
+                        <form id="shotDataForm">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4 mb-6">
+                                <div><label for="shotClubUsed">Club Used (Optional):</label><input type="text" id="shotClubUsed" name="shotClubUsed" placeholder="e.g., Driver, 7 Iron"></div>
+                                <div><label for="shotPenalties">Penalty Strokes (this shot):</label><input type="number" id="shotPenalties" name="shotPenalties" min="0" value="0"></div>
+                                <div><label for="shotEndLie">End Lie:</label><select id="shotEndLie" name="shotEndLie" required><option value="fairway">Fairway</option><option value="rough">Rough</option><option value="sand">Sand</option><option value="recovery">Recovery (Trees, etc.)</option><option value="green">Green</option><option value="fringe">Fringe</option><option value="penalty">Penalty Area</option><option value="tee">Tee (after penalty)</option></select></div>
+                                <div><label for="shotEndDistance">End Distance to Hole:</label><input type="number" id="shotEndDistance" name="shotEndDistance" min="0" required placeholder="Enter distance"><p class="text-xs text-slate-500 mt-1">Enter in FEET if End Lie is Green/Fringe, otherwise YARDS.</p></div>
+                            </div>
+                            <div id="puttDetailsSection" class="hidden mb-6"><div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4"><div data-type="elevation"><label>Elevation</label><div class="flex space-x-2"><button type="button" data-value="uphill" class="putt-detail-btn flex-1">Uphill</button><button type="button" data-value="flat" class="putt-detail-btn flex-1">Flat</button><button type="button" data-value="downhill" class="putt-detail-btn flex-1">Downhill</button></div></div><div data-type="break"><label>Break</label><div class="flex space-x-2"><button type="button" data-value="left-to-right" class="putt-detail-btn flex-1">L to R</button><button type="button" data-value="straight" class="putt-detail-btn flex-1">Straight</button><button type="button" data-value="right-to-left" class="putt-detail-btn flex-1">R to L</button></div></div></div></div>
+                            <div class="flex flex-col sm:flex-row gap-4"><button type="submit" class="btn btn-indigo w-full">Add Shot & Update</button><button id="holedOutButton" type="button" class="btn btn-green w-full">Holed Out</button></div>
+                        </form>
+                        <div class="mt-4 text-right"><button id="undoShotButton" type="button" class="hidden text-sm text-slate-500 hover:text-red-600 font-medium">Undo Last Shot</button></div>
+                    </section>
+                    <div class="mt-8 flex flex-col sm:flex-row justify-center items-center space-y-4 sm:space-y-0 sm:space-x-4"><button id="finishHoleButton" type="button" class="btn btn-green hidden w-full sm:w-auto">Finish Hole & Proceed to Next</button><button id="finishRoundButton" class="btn btn-red hidden w-full sm:w-auto">Finish Round & Save All Data</button></div>
+                </div>
+            </div>
+        </main>
+
+        <footer class="text-center text-sm text-slate-500 mt-16 py-8 border-t border-slate-200">
+            Play the Percentage Golf - &copy; 2025
+        </footer>
+    </div>
+</body>
+</html>
